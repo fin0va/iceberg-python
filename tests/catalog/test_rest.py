@@ -105,6 +105,7 @@ TEST_SUPPORTED_ENDPOINTS = [
     Capability.V1_LIST_VIEWS,
     Capability.V1_LOAD_VIEW,
     Capability.V1_VIEW_EXISTS,
+    Capability.V1_REGISTER_VIEW,
     Capability.V1_DELETE_VIEW,
     Capability.V1_SUBMIT_TABLE_SCAN_PLAN,
     Capability.V1_TABLE_SCAN_PLAN_TASKS,
@@ -638,6 +639,90 @@ def test_list_views_200(rest_mock: Mocker) -> None:
     )
 
     assert RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN).list_views(namespace) == [("examples", "fooshare")]
+
+
+def test_list_views_paginated_200(rest_mock: Mocker) -> None:
+    namespace = "examples"
+    # First page with next-page-token
+    rest_mock.get(
+        f"{TEST_URI}v1/namespaces/{namespace}/views",
+        json={
+            "identifiers": [
+                {"namespace": ["examples"], "name": "view1"},
+                {"namespace": ["examples"], "name": "view2"},
+            ],
+            "next-page-token": "page2token",
+        },
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+    # Second page with next-page-token
+    rest_mock.get(
+        f"{TEST_URI}v1/namespaces/{namespace}/views?pageToken=page2token",
+        json={
+            "identifiers": [
+                {"namespace": ["examples"], "name": "view3"},
+            ],
+            "next-page-token": "page3token",
+        },
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+    # Third page without next-page-token (last page)
+    rest_mock.get(
+        f"{TEST_URI}v1/namespaces/{namespace}/views?pageToken=page3token",
+        json={
+            "identifiers": [
+                {"namespace": ["examples"], "name": "view4"},
+            ],
+        },
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+
+    result = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN).list_views(namespace)
+    assert result == [
+        ("examples", "view1"),
+        ("examples", "view2"),
+        ("examples", "view3"),
+        ("examples", "view4"),
+    ]
+
+
+def test_list_views_paginated_200_none_next_page_token(rest_mock: Mocker) -> None:
+    namespace = "examples"
+    # First page with next-page-token
+    rest_mock.get(
+        f"{TEST_URI}v1/namespaces/{namespace}/views",
+        json={
+            "identifiers": [
+                {"namespace": ["examples"], "name": "view1"},
+                {"namespace": ["examples"], "name": "view2"},
+            ],
+            "next-page-token": "page2token",
+        },
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+    # The last page with NONE next-page-token
+    rest_mock.get(
+        f"{TEST_URI}v1/namespaces/{namespace}/views?pageToken=page2token",
+        json={
+            "identifiers": [
+                {"namespace": ["examples"], "name": "view3"},
+            ],
+            "next-page-token": None,
+        },
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+
+    result = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN).list_views(namespace)
+    assert result == [
+        ("examples", "view1"),
+        ("examples", "view2"),
+        ("examples", "view3"),
+    ]
 
 
 def test_list_views_200_sigv4(rest_mock: Mocker) -> None:
@@ -2180,6 +2265,72 @@ def test_table_identifier_in_commit_table_request(
         rest_mock.last_request.text
         == """{"identifier":{"namespace":["namespace"],"name":"table_name"},"requirements":[],"updates":[]}"""
     )
+
+
+def test_register_view_200(rest_mock: Mocker, example_view_metadata_rest_json: dict[str, Any]) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/default/tables/registered_view",
+        status_code=404,
+        request_headers=TEST_HEADERS,
+    )
+    rest_mock.post(
+        f"{TEST_URI}v1/namespaces/default/register-view",
+        json=example_view_metadata_rest_json,
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    actual = catalog.register_view(
+        identifier=("default", "registered_view"), metadata_location="s3://warehouse/database/view/metadata.json"
+    )
+    expected = View(
+        identifier=("default", "registered_view"),
+        metadata=ViewMetadata(**example_view_metadata_rest_json["metadata"]),
+    )
+    assert actual == expected
+
+
+def test_register_view_409_view(rest_mock: Mocker) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/default/tables/registered_view",
+        status_code=404,
+        request_headers=TEST_HEADERS,
+    )
+    rest_mock.post(
+        f"{TEST_URI}v1/namespaces/default/register-view",
+        json={
+            "error": {
+                "message": "View already exists: default.view in warehouse 8bcb0838-50fc-472d-9ddb-8feb89ef5f1e",
+                "type": "AlreadyExistsException",
+                "code": 409,
+            }
+        },
+        status_code=409,
+        request_headers=TEST_HEADERS,
+    )
+
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    with pytest.raises(ViewAlreadyExistsError) as e:
+        catalog.register_view(
+            identifier=("default", "registered_view"), metadata_location="s3://warehouse/database/view/metadata.json"
+        )
+    assert "View already exists" in str(e.value)
+
+
+def test_register_view_409_table(rest_mock: Mocker) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/default/tables/registered_view",
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    with pytest.raises(TableAlreadyExistsError) as e:
+        catalog.register_view(
+            identifier=("default", "registered_view"), metadata_location="s3://warehouse/database/view/metadata.json"
+        )
+    assert "Table default.registered_view already exists" in str(e.value)
 
 
 def test_drop_view_invalid_namespace(rest_mock: Mocker) -> None:

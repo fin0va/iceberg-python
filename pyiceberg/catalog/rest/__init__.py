@@ -27,6 +27,7 @@ from urllib.parse import quote, unquote
 from pydantic import ConfigDict, Field, TypeAdapter, field_validator
 from requests import HTTPError, Session
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt
+from typing_extensions import override
 
 from pyiceberg import __version__
 from pyiceberg.catalog import BOTOCORE_SESSION, TOKEN, URI, WAREHOUSE_LOCATION, Catalog, MetastoreCatalog, PropertiesUpdateSummary
@@ -153,6 +154,7 @@ class Endpoints:
     list_views: str = "namespaces/{namespace}/views"
     load_view: str = "namespaces/{namespace}/views/{view}"
     create_view: str = "namespaces/{namespace}/views"
+    register_view: str = "namespaces/{namespace}/register-view"
     drop_view: str = "namespaces/{namespace}/views/{view}"
     view_exists: str = "namespaces/{namespace}/views/{view}"
     plan_table_scan: str = "namespaces/{namespace}/tables/{table}/plan"
@@ -182,6 +184,7 @@ class Capability:
     V1_LIST_VIEWS = Endpoint(http_method=HttpMethod.GET, path=f"{API_PREFIX}/{Endpoints.list_views}")
     V1_LOAD_VIEW = Endpoint(http_method=HttpMethod.GET, path=f"{API_PREFIX}/{Endpoints.load_view}")
     V1_VIEW_EXISTS = Endpoint(http_method=HttpMethod.HEAD, path=f"{API_PREFIX}/{Endpoints.view_exists}")
+    V1_REGISTER_VIEW = Endpoint(http_method=HttpMethod.POST, path=f"{API_PREFIX}/{Endpoints.register_view}")
     V1_DELETE_VIEW = Endpoint(http_method=HttpMethod.DELETE, path=f"{API_PREFIX}/{Endpoints.drop_view}")
     V1_SUBMIT_TABLE_SCAN_PLAN = Endpoint(http_method=HttpMethod.POST, path=f"{API_PREFIX}/{Endpoints.plan_table_scan}")
     V1_TABLE_SCAN_PLAN_TASKS = Endpoint(http_method=HttpMethod.POST, path=f"{API_PREFIX}/{Endpoints.fetch_scan_tasks}")
@@ -321,6 +324,11 @@ class RegisterTableRequest(IcebergBaseModel):
     overwrite: bool
 
 
+class RegisterViewRequest(IcebergBaseModel):
+    name: str
+    metadata_location: str = Field(..., alias="metadata-location")
+
+
 class ConfigResponse(IcebergBaseModel):
     defaults: Properties | None = Field(default_factory=dict)
     overrides: Properties | None = Field(default_factory=dict)
@@ -372,6 +380,7 @@ class ListTablesResponse(IcebergBaseModel):
 
 class ListViewsResponse(IcebergBaseModel):
     identifiers: list[ListViewResponseEntry] = Field()
+    next_page_token: str | None = Field(default=None, alias="next-page-token")
 
 
 _PLANNING_RESPONSE_ADAPTER = TypeAdapter(PlanningResponse)
@@ -470,6 +479,7 @@ class RestCatalog(MetastoreCatalog):
             merged_properties[AUTH_MANAGER] = self._auth_manager
         return load_file_io(merged_properties, location)
 
+    @override
     def supports_server_side_planning(self) -> bool:
         """Check if the catalog supports server-side scan planning."""
         return Capability.V1_SUBMIT_TABLE_SCAN_PLAN in self._supported_endpoints and property_as_bool(
@@ -926,6 +936,7 @@ class RestCatalog(MetastoreCatalog):
             )
         return tr
 
+    @override
     @retry(**_RETRY_ARGS)
     def create_table(
         self,
@@ -947,6 +958,7 @@ class RestCatalog(MetastoreCatalog):
         )
         return self._response_to_table(self.identifier_to_tuple(identifier), table_response)
 
+    @override
     @retry(**_RETRY_ARGS)
     def create_table_transaction(
         self,
@@ -969,6 +981,7 @@ class RestCatalog(MetastoreCatalog):
         staged_table = self._response_to_staged_table(self.identifier_to_tuple(identifier), table_response)
         return CreateTableTransaction(staged_table)
 
+    @override
     @retry(**_RETRY_ARGS)
     def create_view(
         self,
@@ -1008,6 +1021,7 @@ class RestCatalog(MetastoreCatalog):
         return self._response_to_view(self.identifier_to_tuple(identifier), view_response)
 
     @retry(**_RETRY_ARGS)
+    @override
     def register_table(self, identifier: str | Identifier, metadata_location: str, overwrite: bool = False) -> Table:
         """Register a new table using existing metadata.
 
@@ -1043,6 +1057,7 @@ class RestCatalog(MetastoreCatalog):
         return self._response_to_table(self.identifier_to_tuple(identifier), table_response)
 
     @retry(**_RETRY_ARGS)
+    @override
     def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
         self._check_endpoint(Capability.V1_LIST_TABLES)
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
@@ -1055,6 +1070,7 @@ class RestCatalog(MetastoreCatalog):
         return [(*table.namespace, table.name) for table in ListTablesResponse.model_validate_json(response.text).identifiers]
 
     @retry(**_RETRY_ARGS)
+    @override
     def load_table(self, identifier: str | Identifier) -> Table:
         tr = self._load_table(identifier)
         if self.properties.get(PREFER_CLIENT_SIDE_METADATA):
@@ -1094,6 +1110,7 @@ class RestCatalog(MetastoreCatalog):
         return self._response_to_table(self.identifier_to_tuple(identifier), table_response)
 
     @retry(**_RETRY_ARGS)
+    @override
     def drop_table(self, identifier: str | Identifier, purge_requested: bool = False) -> None:
         self._check_endpoint(Capability.V1_DELETE_TABLE)
         response = self._session.delete(
@@ -1106,10 +1123,12 @@ class RestCatalog(MetastoreCatalog):
             _handle_non_200_response(exc, {404: NoSuchTableError})
 
     @retry(**_RETRY_ARGS)
+    @override
     def purge_table(self, identifier: str | Identifier) -> None:
         self.drop_table(identifier=identifier, purge_requested=True)
 
     @retry(**_RETRY_ARGS)
+    @override
     def rename_table(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> Table:
         self._check_endpoint(Capability.V1_RENAME_TABLE)
         payload = {
@@ -1146,19 +1165,36 @@ class RestCatalog(MetastoreCatalog):
         return table_request
 
     @retry(**_RETRY_ARGS)
+    @override
     def list_views(self, namespace: str | Identifier) -> list[Identifier]:
         if Capability.V1_LIST_VIEWS not in self._supported_endpoints:
             return []
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
         namespace_concat = self._encode_namespace_path(namespace_tuple)
-        response = self._session.get(self.url(Endpoints.list_views, namespace=namespace_concat))
-        try:
-            response.raise_for_status()
-        except HTTPError as exc:
-            _handle_non_200_response(exc, {404: NoSuchNamespaceError})
-        return [(*view.namespace, view.name) for view in ListViewsResponse.model_validate_json(response.text).identifiers]
+        url = self.url(Endpoints.list_views, namespace=namespace_concat)
+
+        views: list[Identifier] = []
+        page_token: str | None = None
+
+        while True:
+            params = {"pageToken": page_token} if page_token else None
+            response = self._session.get(url, params=params)
+            try:
+                response.raise_for_status()
+            except HTTPError as exc:
+                _handle_non_200_response(exc, {404: NoSuchNamespaceError})
+
+            parsed = ListViewsResponse.model_validate_json(response.text)
+            views.extend([(*view.namespace, view.name) for view in parsed.identifiers])
+
+            if not parsed.next_page_token:
+                break
+            page_token = parsed.next_page_token
+
+        return views
 
     @retry(**_RETRY_ARGS)
+    @override
     def load_view(self, identifier: str | Identifier) -> View:
         self._check_endpoint(Capability.V1_LOAD_VIEW)
         response = self._session.get(
@@ -1173,6 +1209,7 @@ class RestCatalog(MetastoreCatalog):
         return self._response_to_view(self.identifier_to_tuple(identifier), view_response)
 
     @retry(**_RETRY_ARGS)
+    @override
     def commit_table(
         self, table: Table, requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
     ) -> CommitTableResponse:
@@ -1238,6 +1275,7 @@ class RestCatalog(MetastoreCatalog):
         return CommitTableResponse.model_validate_json(response.text)
 
     @retry(**_RETRY_ARGS)
+    @override
     def create_namespace(self, namespace: str | Identifier, properties: Properties = EMPTY_DICT) -> None:
         self._check_endpoint(Capability.V1_CREATE_NAMESPACE)
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
@@ -1249,6 +1287,7 @@ class RestCatalog(MetastoreCatalog):
             _handle_non_200_response(exc, {409: NamespaceAlreadyExistsError})
 
     @retry(**_RETRY_ARGS)
+    @override
     def drop_namespace(self, namespace: str | Identifier) -> None:
         self._check_endpoint(Capability.V1_DELETE_NAMESPACE)
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
@@ -1260,6 +1299,7 @@ class RestCatalog(MetastoreCatalog):
             _handle_non_200_response(exc, {404: NoSuchNamespaceError, 409: NamespaceNotEmptyError})
 
     @retry(**_RETRY_ARGS)
+    @override
     def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
         self._check_endpoint(Capability.V1_LIST_NAMESPACES)
         namespace_tuple = self.identifier_to_tuple(namespace)
@@ -1278,6 +1318,7 @@ class RestCatalog(MetastoreCatalog):
         return ListNamespaceResponse.model_validate_json(response.text).namespaces
 
     @retry(**_RETRY_ARGS)
+    @override
     def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
         self._check_endpoint(Capability.V1_LOAD_NAMESPACE)
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
@@ -1291,6 +1332,7 @@ class RestCatalog(MetastoreCatalog):
         return NamespaceResponse.model_validate_json(response.text).properties
 
     @retry(**_RETRY_ARGS)
+    @override
     def update_namespace_properties(
         self, namespace: str | Identifier, removals: set[str] | None = None, updates: Properties = EMPTY_DICT
     ) -> PropertiesUpdateSummary:
@@ -1311,6 +1353,7 @@ class RestCatalog(MetastoreCatalog):
         )
 
     @retry(**_RETRY_ARGS)
+    @override
     def namespace_exists(self, namespace: str | Identifier) -> bool:
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
         namespace = self._encode_namespace_path(namespace_tuple)
@@ -1338,6 +1381,7 @@ class RestCatalog(MetastoreCatalog):
         return False
 
     @retry(**_RETRY_ARGS)
+    @override
     def table_exists(self, identifier: str | Identifier) -> bool:
         """Check if a table exists.
 
@@ -1372,6 +1416,7 @@ class RestCatalog(MetastoreCatalog):
         return False
 
     @retry(**_RETRY_ARGS)
+    @override
     def view_exists(self, identifier: str | Identifier) -> bool:
         """Check if a view exists.
 
@@ -1397,6 +1442,31 @@ class RestCatalog(MetastoreCatalog):
         return False
 
     @retry(**_RETRY_ARGS)
+    @override
+    def register_view(self, identifier: str | Identifier, metadata_location: str) -> View:
+        self._check_endpoint(Capability.V1_REGISTER_VIEW)
+        namespace_and_view = self._split_identifier_for_path(identifier, IdentifierKind.VIEW)
+        namespace = namespace_and_view["namespace"]
+        view = namespace_and_view["view"]
+        if self.table_exists(identifier):
+            raise TableAlreadyExistsError(f"Table {namespace}.{view} already exists")
+
+        request = RegisterViewRequest(name=view, metadata_location=metadata_location)
+        serialized_json = request.model_dump_json().encode(UTF8)
+        response = self._session.post(
+            self.url(Endpoints.register_view, namespace=namespace),
+            data=serialized_json,
+        )
+        try:
+            response.raise_for_status()
+        except HTTPError as exc:
+            _handle_non_200_response(exc, {409: ViewAlreadyExistsError})
+
+        view_response = ViewResponse.model_validate_json(response.text)
+        return self._response_to_view(self.identifier_to_tuple(identifier), view_response)
+
+    @retry(**_RETRY_ARGS)
+    @override
     def drop_view(self, identifier: str) -> None:
         self._check_endpoint(Capability.V1_DELETE_VIEW)
         response = self._session.delete(
